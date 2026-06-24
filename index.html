@@ -1,0 +1,1066 @@
+<!DOCTYPE html>
+<!--
+  AIoTIE — Certificate Verification Portal
+  =====================================================================
+  Top-level, plain-static HTML page. Year-agnostic — the same
+  deployment is reused across AIoTIE editions; the per-cert year
+  lives inside each AIoTIE ID (e.g. AIOTIE2026-136). No iframe
+  wrappers, no Apps Script HTML hosting. We use this page as the
+  full UI and call the GAS JSON API (deployed separately) over
+  fetch() for the actual certificate lookup.
+
+  Hosting:
+    Any static host — GitHub Pages, Netlify, Cloudflare Pages, or
+    a regular web host. The file just needs to be served over HTTPS
+    (camera APIs require it).
+
+  Backend:
+    GAS_API_URL below points at the deployed Apps Script JSON
+    endpoint (see Code.gs in the same folder for the source).
+    The endpoint accepts `?id=AIOTIE2026-XXX` and returns the
+    verification envelope as JSON. CORS is permissive for GETs.
+-->
+<html lang="en">
+<head>
+  <base target="_top" />
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="referrer" content="origin" />
+  <meta name="theme-color" content="#0b1b3a" />
+  <title>AIoTIE — Certificate Verification</title>
+
+  <!-- html5-qrcode — wraps getUserMedia + a ZXing-based QR decoder.
+       Drives the live scanner. On modern browsers it delegates to
+       the native BarcodeDetector (see experimentalFeatures below)
+       for much better tolerance of motion blur and screen moiré. -->
+  <script src="https://cdn.jsdelivr.net/npm/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+
+  <style>
+    :root {
+      --ink:    #0b1b3a;
+      --muted:  #475569;
+      --line:   #e6e8ee;
+      --bg:     #f6f7fb;
+      --green:  #16a34a;
+      --green-soft: rgba(22,163,74,0.08);
+      --red:    #dc2626;
+      --red-soft: rgba(220,38,38,0.08);
+      --gold:   #b45309;
+    }
+    *, *::before, *::after { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: "Helvetica", "Helvetica Neue", Arial, sans-serif;
+      -webkit-text-size-adjust: 100%;
+    }
+    /* Footer is rendered with position:fixed (see .foot rule
+       below) so it always sits at the bottom edge of the
+       viewport, regardless of how tall .page is. .page just
+       needs to reserve enough bottom padding (88px) so the
+       last card doesn't hide behind the fixed footer when the
+       user scrolls. No flexbox / 100vh tricks — works in every
+       browser including iOS Safari. */
+    .page {
+      max-width: 640px;
+      width: 100%;
+      margin: 0 auto;
+      padding: 24px 18px 88px;
+    }
+
+    .brand { text-align: center; margin-bottom: 18px; }
+    .brand img { max-width: 110px; width: 28mm; height: auto; }
+    .brand .name {
+      margin-top: 6px;
+      font-weight: 900;
+      font-size: 15px;
+      letter-spacing: 0.3px;
+    }
+    .brand .sub {
+      margin-top: 2px;
+      font-size: 12px;
+      color: var(--muted);
+      font-weight: 700;
+      letter-spacing: 0.5px;
+      text-transform: uppercase;
+    }
+
+    .card {
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 18px;
+      margin-bottom: 16px;
+    }
+    .card h2 {
+      font-size: 13px;
+      letter-spacing: 0.6px;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin: 0 0 10px 0;
+      font-weight: 800;
+    }
+    .card p.lead {
+      margin: 0 0 14px 0;
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.55;
+    }
+
+    /* Wrapper that lets the scan-line overlay sit ON TOP of the
+       camera feed at the same position. */
+    .reader-wrap {
+      position: relative;
+      width: 100%;
+      max-width: 360px;
+      margin: 0 auto;
+    }
+    #reader {
+      width: 100%;
+      border-radius: 12px;
+      overflow: hidden;
+      background: #000;
+      aspect-ratio: 1 / 1;
+    }
+    #reader video { width: 100% !important; height: 100% !important; }
+    #reader__scan_region { background: #000; }
+
+    /* Moving green scan line — visual cue that the scanner is
+       actively trying to decode. Sits inside the reader area via
+       position:absolute on the wrapper, animates between the top
+       and bottom of the qrbox. pointer-events:none so it doesn't
+       interfere with the camera UI. */
+    .scan-line {
+      position: absolute;
+      left: 12%;
+      right: 12%;
+      height: 2px;
+      top: 18%;
+      background: linear-gradient(
+        90deg,
+        rgba(34,197,94,0)   0%,
+        rgba(34,197,94,0.9) 30%,
+        rgba(34,197,94,0.9) 70%,
+        rgba(34,197,94,0)   100%
+      );
+      box-shadow: 0 0 10px rgba(34,197,94,0.85);
+      pointer-events: none;
+      z-index: 5;
+      border-radius: 2px;
+      animation: scanline 2.4s ease-in-out infinite;
+    }
+    @keyframes scanline {
+      0%, 100% { top: 18%; }
+      50%      { top: 78%; }
+    }
+
+    /* "Scanning…" status row with pulsing dot — sits below the
+       camera so the user knows the scanner is doing work. */
+    .scan-status {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      margin-top: 12px;
+      font-size: 14px;
+      color: #166534;
+      font-weight: 800;
+      letter-spacing: 0.3px;
+    }
+    .pulse-dot {
+      width: 10px;
+      height: 10px;
+      background: #16a34a;
+      border-radius: 50%;
+      box-shadow: 0 0 8px rgba(22,163,74,0.7);
+      animation: pulse 1.2s ease-in-out infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { transform: scale(1);   opacity: 1;   }
+      50%      { transform: scale(1.4); opacity: 0.45; }
+    }
+
+    .scanner-empty {
+      width: 100%;
+      max-width: 360px;
+      margin: 0 auto;
+      aspect-ratio: 1 / 1;
+      border-radius: 12px;
+      background: #0b1b3a;
+      color: #fff;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-direction: column;
+      gap: 8px;
+      font-size: 13px;
+      letter-spacing: 0.3px;
+      opacity: 0.85;
+    }
+    .scanner-empty .big { font-size: 44px; line-height: 1; }
+
+    .btn-row {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      justify-content: center;
+      margin-top: 14px;
+    }
+    .btn {
+      appearance: none;
+      border: 0;
+      border-radius: 999px;
+      padding: 10px 18px;
+      font-weight: 900;
+      font-size: 14px;
+      letter-spacing: 0.3px;
+      cursor: pointer;
+      background: var(--ink);
+      color: #fff;
+    }
+    .btn.secondary { background: #e9eefc; color: var(--ink); }
+    .btn[disabled] { opacity: 0.5; cursor: not-allowed; }
+
+    .manual-form {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      align-items: stretch;
+    }
+    .manual-form input {
+      flex: 1 1 220px;
+      min-width: 0;
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid var(--line);
+      font-size: 14px;
+      font-family: inherit;
+      background: #fff;
+      color: var(--ink);
+    }
+
+    .verdict {
+      border-radius: 14px;
+      padding: 20px;
+      margin-bottom: 14px;
+    }
+    .verdict--ok  { background: var(--green-soft); border: 1px solid rgba(22,163,74,0.30); }
+    .verdict--bad { background: var(--red-soft);   border: 1px solid rgba(220,38,38,0.30); }
+    .verdict__icon {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 56px;
+      height: 56px;
+      border-radius: 999px;
+      font-size: 28px;
+      font-weight: 900;
+      margin-bottom: 10px;
+      color: #fff;
+    }
+    .verdict--ok  .verdict__icon { background: var(--green); }
+    .verdict--bad .verdict__icon { background: var(--red); }
+    .verdict__title {
+      font-size: 18px;
+      font-weight: 900;
+      margin: 0 0 4px 0;
+    }
+    .verdict--ok  .verdict__title { color: var(--green); }
+    .verdict--bad .verdict__title { color: var(--red); }
+    .verdict__sub {
+      font-size: 13px;
+      color: var(--muted);
+      line-height: 1.55;
+      margin: 0;
+    }
+
+    .row {
+      display: flex;
+      gap: 12px;
+      padding: 10px 0;
+      border-bottom: 1px solid var(--line);
+      flex-wrap: wrap;
+    }
+    .row:last-child { border-bottom: 0; }
+    .row .k {
+      flex: 0 0 130px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.3px;
+      text-transform: uppercase;
+      padding-top: 2px;
+    }
+    .row .v {
+      flex: 1 1 200px;
+      min-width: 0;
+      font-weight: 700;
+      color: var(--ink);
+      font-size: 14px;
+      line-height: 1.5;
+      word-break: break-word;
+    }
+
+    .members-list { margin: 0; padding: 0; list-style: none; }
+    .members-list li { padding: 1px 0; }
+
+    .queried-id {
+      font-size: 12px;
+      color: var(--muted);
+      margin-top: 6px;
+      font-family: ui-monospace, "SF Mono", Menlo, monospace;
+      word-break: break-all;
+    }
+
+    .note {
+      background: rgba(245,158,11,0.10);
+      border: 1px solid rgba(245,158,11,0.40);
+      border-radius: 12px;
+      color: var(--gold);
+      padding: 12px 14px;
+      font-size: 13px;
+      line-height: 1.55;
+    }
+
+    /* Footer pinned to the bottom edge of the viewport. We use
+       position:fixed instead of flexbox because mobile Safari
+       has quirky vh / dvh behavior that left an empty band
+       between content and viewport bottom. Fixed positioning
+       is the simplest reliable way to anchor it.
+
+       The background matches the page so the footer area looks
+       continuous with the rest of the page. The thin top border
+       softly separates the cards from the footer when content
+       scrolls beneath it. */
+    .foot {
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      text-align: center;
+      color: var(--muted);
+      font-size: 12px;
+      padding: 14px 16px;
+      background: var(--bg);
+      border-top: 1px solid var(--line);
+      line-height: 1.55;
+      z-index: 5;
+    }
+    .foot a { color: var(--ink); text-decoration: none; font-weight: 700; }
+
+    .hidden { display: none !important; }
+
+    .spinner {
+      display: inline-block;
+      width: 14px;
+      height: 14px;
+      border: 2px solid currentColor;
+      border-right-color: transparent;
+      border-radius: 999px;
+      animation: spin 0.6s linear infinite;
+      vertical-align: middle;
+      margin-right: 6px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ----- Decoding modal (overlay shown between QR detection
+       and the result render) -------------------------------------
+       Sits above everything else via z-index + position:fixed.
+       Backdrop dims the page; the card centers a big spinner +
+       "Decoding…" message so the user has a clear, isolated
+       "we're working on it" surface. Closes with a fade + scale
+       animation, then the verdict scrolls into view. */
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(11, 27, 58, 0.55);
+      -webkit-backdrop-filter: blur(6px);
+      backdrop-filter: blur(6px);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 1000;
+      padding: 20px;
+      animation: modalFadeIn 0.18s ease-out;
+    }
+    .modal-backdrop.modal-leaving {
+      animation: modalFadeOut 0.20s ease-in forwards;
+    }
+    .modal-card {
+      background: #fff;
+      border-radius: 16px;
+      padding: 28px 30px;
+      text-align: center;
+      max-width: 320px;
+      width: 100%;
+      box-shadow: 0 16px 40px rgba(0,0,0,0.30);
+      animation: modalPop 0.22s cubic-bezier(0.34, 1.56, 0.64, 1);
+    }
+    .modal-spinner {
+      width: 44px;
+      height: 44px;
+      border: 4px solid rgba(11,27,58,0.12);
+      border-top-color: #0b1b3a;
+      border-radius: 50%;
+      margin: 0 auto 14px;
+      animation: spin 0.8s linear infinite;
+    }
+    .modal-title {
+      font-size: 17px;
+      font-weight: 900;
+      color: var(--ink);
+      margin: 0 0 6px 0;
+      letter-spacing: 0.2px;
+    }
+    .modal-sub {
+      font-size: 13px;
+      color: var(--muted);
+      line-height: 1.5;
+      margin: 0;
+      word-break: break-all;
+    }
+    @keyframes modalFadeIn  { from { opacity: 0; } to { opacity: 1; } }
+    @keyframes modalFadeOut { from { opacity: 1; } to { opacity: 0; } }
+    @keyframes modalPop {
+      from { transform: scale(0.82); opacity: 0; }
+      to   { transform: scale(1);    opacity: 1; }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+
+    <div class="brand">
+      <img
+        src="https://drive.google.com/thumbnail?id=1Eng7oXLS_1bwSzhtsiclJNuqVldDg88O"
+        alt="AIoTIE"
+      />
+      <div class="name">AIoTIE Competition</div>
+      <div class="sub">Certificate Verification Portal</div>
+    </div>
+
+    <!-- Scanner -->
+    <div id="scannerCard" class="card">
+      <h2>Step 1 — Scan the QR</h2>
+      <p class="lead">
+        Tap <b>Start Scanner</b>, then point your camera at the QR code
+        printed on the certificate. The scanner reads the AIoTIE ID and
+        looks it up in the official register.
+      </p>
+
+      <div class="reader-wrap">
+        <div id="scannerEmpty" class="scanner-empty">
+          <div class="big">&#x2316;</div>
+          <div>Scanner not started</div>
+        </div>
+        <div id="reader" class="hidden"></div>
+        <div id="scanLine" class="scan-line hidden"></div>
+      </div>
+
+      <div id="scanStatus" class="scan-status hidden">
+        <span class="pulse-dot"></span>
+        <span id="scanStatusText">Scanning… hold the camera steady on the QR</span>
+      </div>
+
+      <div class="btn-row">
+        <button id="btnStart" class="btn" type="button">Start Scanner</button>
+        <button id="btnStop" class="btn secondary hidden" type="button">Stop Scanner</button>
+      </div>
+
+      <div id="scanError" class="note hidden" style="margin-top:14px;"></div>
+    </div>
+
+    <!-- Manual fallback -->
+    <div id="manualCard" class="card">
+      <h2>Or enter the AIoTIE ID manually</h2>
+      <p class="lead">
+        Useful when scanning isn't possible — for example, if the QR is
+        damaged or you're verifying from a photo.
+      </p>
+      <form id="manualForm" class="manual-form">
+        <input
+          id="manualId"
+          type="text"
+          placeholder="e.g. AIOTIE2026-136"
+          autocomplete="off"
+          autocapitalize="characters"
+          spellcheck="false"
+        />
+        <button class="btn" type="submit">Verify</button>
+      </form>
+    </div>
+
+    <!-- Result panel -->
+    <div id="resultArea" class="hidden">
+      <div id="verdict" class="verdict">
+        <div id="verdictIcon" class="verdict__icon">&#x2713;</div>
+        <h1 id="verdictTitle" class="verdict__title">Genuine Certificate</h1>
+        <p id="verdictSub" class="verdict__sub"></p>
+        <div id="queriedId" class="queried-id hidden"></div>
+      </div>
+
+      <div id="detailsCard" class="card hidden">
+        <h2 id="dCardTitle">Official Record</h2>
+
+        <!-- ===== CERT-only rows ===== -->
+        <div class="row" id="rowAiotieId">
+          <div class="k">AIoTIE ID</div>
+          <div class="v" id="dAiotieId"></div>
+        </div>
+        <div class="row" id="rowProductTitle">
+          <div class="k">Product Title</div>
+          <div class="v" id="dProductTitle"></div>
+        </div>
+        <div class="row" id="rowLeader">
+          <div class="k">Product Leader</div>
+          <div class="v" id="dLeader"></div>
+        </div>
+        <div class="row" id="rowMembers">
+          <div class="k">Members</div>
+          <div class="v">
+            <ul id="dMembers" class="members-list"></ul>
+          </div>
+        </div>
+
+        <!-- ===== JURY-only rows ===== -->
+        <div class="row hidden" id="rowAuthCode">
+          <div class="k">Verification Code</div>
+          <div class="v" id="dAuthCode"></div>
+        </div>
+        <div class="row hidden" id="rowJurorName">
+          <div class="k">Juror</div>
+          <div class="v" id="dJurorName"></div>
+        </div>
+        <div class="row hidden" id="rowJurorAffiliation">
+          <div class="k">Affiliation</div>
+          <div class="v" id="dJurorAffiliation"></div>
+        </div>
+        <div class="row hidden" id="rowJurorCountry">
+          <div class="k">Country</div>
+          <div class="v" id="dJurorCountry"></div>
+        </div>
+        <div class="row hidden" id="rowAppointment">
+          <div class="k">Appointment</div>
+          <div class="v" id="dAppointment"></div>
+        </div>
+
+        <!-- ===== Shared rows ===== -->
+        <div class="row" id="rowInstitution">
+          <div class="k">Institution</div>
+          <div class="v" id="dInstitution"></div>
+        </div>
+        <div class="row" id="rowIssuedAt">
+          <div class="k">Issued On</div>
+          <div class="v" id="dIssuedAt"></div>
+        </div>
+      </div>
+
+      <div id="resultNote" class="note hidden"></div>
+
+      <div class="btn-row" style="justify-content:center; margin-top:8px;">
+        <button id="btnAgain" class="btn" type="button">Scan another</button>
+      </div>
+    </div>
+
+    <div class="foot">
+      AIoTIE Secretariat<br/>
+      <a href="https://www.mlrg.net" target="_blank" rel="noopener">
+        mlrg.net
+      </a>
+    </div>
+  </div>
+
+  <!-- Decoding modal — shown between QR detection and the result
+       render. See showDecodeModal / hideDecodeModal in the script
+       block below for the timing logic. -->
+  <div id="decodeModal" class="modal-backdrop hidden" aria-hidden="true">
+    <div class="modal-card" role="dialog" aria-modal="true" aria-live="polite">
+      <div class="modal-spinner"></div>
+      <div class="modal-title">Decoding…</div>
+      <div class="modal-sub" id="modalSub">Please wait while we verify the certificate</div>
+    </div>
+  </div>
+
+  <script>
+    // =================================================================
+    // CONFIG — set this once after deploying the GAS JSON API.
+    // Replace with the deployed /exec URL of the standalone GAS
+    // project (see Code.gs in the same folder).
+    // =================================================================
+    var GAS_API_URL =
+      "https://script.google.com/macros/s/AKfycbyEZNhBSBjoeHkkQapl9M6eKjSjSusM_iNbUvP0gr2UEgap90M4XV_m32zsTieaZaUIpQ/exec";
+
+    var $ = function (id) { return document.getElementById(id); };
+    var scannerCard    = $("scannerCard");
+    var manualCard     = $("manualCard");
+    var scannerEmpty   = $("scannerEmpty");
+    var readerEl       = $("reader");
+    var scanLine       = $("scanLine");
+    var scanStatus     = $("scanStatus");
+    var scanStatusText = $("scanStatusText");
+    var btnStart       = $("btnStart");
+    var btnStop        = $("btnStop");
+    var scanError      = $("scanError");
+    var manualForm     = $("manualForm");
+    var manualId       = $("manualId");
+    var resultArea     = $("resultArea");
+    var verdict        = $("verdict");
+    var verdictIcon    = $("verdictIcon");
+    var verdictTitle   = $("verdictTitle");
+    var verdictSub     = $("verdictSub");
+    var queriedIdEl    = $("queriedId");
+    var detailsCard    = $("detailsCard");
+    var resultNote     = $("resultNote");
+    var btnAgain       = $("btnAgain");
+
+    // Show / hide the input-side cards (scanner + manual) so the
+    // verdict has the page to itself. Tidies the layout and stops
+    // the empty-feeling whitespace below the result when the user
+    // scrolls.
+    function hideInputCards() {
+      scannerCard.classList.add("hidden");
+      manualCard.classList.add("hidden");
+    }
+    function showInputCards() {
+      scannerCard.classList.remove("hidden");
+      manualCard.classList.remove("hidden");
+    }
+
+    var scanner = null;
+    var isLookingUp = false;
+
+    function showScanIndicators(text) {
+      scanLine.classList.remove("hidden");
+      scanStatus.classList.remove("hidden");
+      if (text) scanStatusText.textContent = text;
+    }
+    function hideScanIndicators() {
+      scanLine.classList.add("hidden");
+      scanStatus.classList.add("hidden");
+    }
+
+    // ----- Decoding modal -------------------------------------------
+    // Sequence we want when a QR is recognised (or a manual ID is
+    // submitted):
+    //
+    //   1. modal appears IMMEDIATELY with the spinner + "Decoding…"
+    //   2. minimum display time of 500 ms so a fast lookup doesn't
+    //      flash the modal too briefly to register
+    //   3. fade-out animation (~200 ms)
+    //   4. THEN the page smooth-scrolls down to the verdict card
+    //
+    // Step 4 is what gives the user the "result reveal" feel —
+    // the modal closes, and the page glides down to show them
+    // exactly what was verified.
+    var decodeModal       = $("decodeModal");
+    var modalSub          = $("modalSub");
+    var MODAL_MIN_DISPLAY = 500;   // ms
+    var MODAL_FADE_OUT    = 220;   // ms — must match CSS modalFadeOut
+    var modalShownAt      = 0;
+    var modalIsVisible    = false;
+
+    function showDecodeModal(aiotieId) {
+      modalShownAt = Date.now();
+      modalSub.textContent = aiotieId
+        ? "Verifying " + aiotieId + "…"
+        : "Please wait while we verify the certificate";
+      decodeModal.classList.remove("modal-leaving");
+      decodeModal.classList.remove("hidden");
+      decodeModal.setAttribute("aria-hidden", "false");
+      modalIsVisible = true;
+    }
+
+    function hideDecodeModal(onHidden) {
+      if (!modalIsVisible) {
+        if (onHidden) onHidden();
+        return;
+      }
+      var elapsed = Date.now() - modalShownAt;
+      var hold    = Math.max(0, MODAL_MIN_DISPLAY - elapsed);
+
+      setTimeout(function () {
+        // Trigger the fade-out animation, then actually hide the
+        // element after the animation completes so the transition
+        // is smooth instead of an abrupt cut.
+        decodeModal.classList.add("modal-leaving");
+        setTimeout(function () {
+          decodeModal.classList.add("hidden");
+          decodeModal.classList.remove("modal-leaving");
+          decodeModal.setAttribute("aria-hidden", "true");
+          modalIsVisible = false;
+          if (onHidden) onHidden();
+        }, MODAL_FADE_OUT);
+      }, hold);
+    }
+
+    function showError(msg) {
+      scanError.textContent = msg || "";
+      scanError.classList.toggle("hidden", !msg);
+    }
+    function hideResult() { resultArea.classList.add("hidden"); }
+    function setBusy(busy) {
+      isLookingUp = !!busy;
+      btnStart.disabled = !!busy;
+    }
+
+    // The cert QR encodes only the bare AIoTIE ID, but for safety
+    // (and pasted URLs in the manual input) we still try parsing
+    // the scanned text as a URL and pulling an `id` query param.
+    function extractIdFromQrText(text) {
+      try {
+        var u = new URL(String(text || ""));
+        var v = u.searchParams.get("id");
+        if (v) return v.trim();
+      } catch (_) {}
+      return String(text || "").trim();
+    }
+
+    // ----- Live camera -------------------------------------------------
+    function startScanner() {
+      showError("");
+      hideResult();
+      if (typeof Html5Qrcode !== "function") {
+        showError("Scanner library failed to load. Please refresh and try again.");
+        return;
+      }
+
+      scannerEmpty.classList.add("hidden");
+      readerEl.classList.remove("hidden");
+      btnStart.classList.add("hidden");
+      btnStop.classList.remove("hidden");
+
+      // Reveal the scan-line + pulsing status row right away so
+      // the user sees activity even before the camera permission
+      // prompt is resolved. If start() fails, teardownScanner
+      // hides them again.
+      showScanIndicators("Scanning… hold the camera steady on the QR");
+
+      scanner = new Html5Qrcode("reader");
+      scanner.start(
+        { facingMode: "environment" },
+        {
+          // Higher fps = more decode attempts per second, helps
+          // pick up the QR within a single hand-held second.
+          fps: 25,
+          // Dynamic qrbox sized to the viewfinder instead of a
+          // fixed 240×240. On tall iPhone aspect ratios the old
+          // size was a tiny middle square; this gives the decoder
+          // roughly the central 70% of whichever dimension is
+          // smaller — large enough that the QR fills a healthy
+          // portion of the scan area.
+          qrbox: function (viewfinderWidth, viewfinderHeight) {
+            var minEdge = Math.min(viewfinderWidth, viewfinderHeight);
+            var size = Math.floor(minEdge * 0.7);
+            return { width: size, height: size };
+          },
+          aspectRatio: 1.0,
+          // Use the browser's native BarcodeDetector when it's
+          // available (iOS 17+ Safari, modern Chrome / Edge).
+          // The native detector is dramatically more tolerant of
+          // motion blur, moiré from screens, and oddly-lit QRs
+          // than the bundled ZXing-JS fallback. We still keep
+          // the ZXing decoder as the in-library fallback for
+          // browsers that don't expose BarcodeDetector.
+          experimentalFeatures: {
+            useBarCodeDetectorIfSupported: true
+          }
+        },
+        onScanSuccess,
+        function () {}
+      ).catch(function (err) {
+        var raw = (err && err.message) ? err.message : String(err || "");
+        showError(
+          "Live camera is not available in this browser. " +
+          "Tap \"Take Photo / Upload\" instead — it opens your " +
+          "phone's normal camera, snap one photo of the QR, and we'll " +
+          "decode it from there. (Details: " + raw + ")"
+        );
+        teardownScanner();
+      });
+    }
+
+    function teardownScanner() {
+      btnStop.classList.add("hidden");
+      btnStart.classList.remove("hidden");
+      readerEl.classList.add("hidden");
+      scannerEmpty.classList.remove("hidden");
+      hideScanIndicators();
+      if (scanner) {
+        try { scanner.stop().catch(function(){}); } catch (_) {}
+        try { scanner.clear(); } catch (_) {}
+        scanner = null;
+      }
+    }
+
+    function onScanSuccess(decodedText) {
+      if (isLookingUp) return;
+      var id = extractIdFromQrText(decodedText);
+      if (!id) return;
+      // Brief visual confirmation that we got a QR before the
+      // camera shuts down — the status row flashes "QR found"
+      // for a heartbeat. Helps the user understand the camera
+      // closing isn't a crash, it succeeded.
+      showScanIndicators("QR found — verifying…");
+      teardownScanner();
+      lookup(id);
+    }
+
+    // ----- Lookup over fetch() to the GAS JSON API ---------------------
+    function lookup(rawId) {
+      var id = String(rawId || "").trim();
+      if (!id) {
+        renderInvalid("", "Please provide an AIoTIE ID.");
+        return;
+      }
+
+      // Surface the "Decoding…" modal immediately. It hangs over
+      // the page until the verdict is ready, then fades out and
+      // the page scrolls down to the result card.
+      showDecodeModal(id);
+
+      setBusy(true);
+      resultArea.classList.remove("hidden");
+      verdict.className = "verdict";
+      verdict.style.background = "#fff";
+      verdict.style.border = "1px solid var(--line)";
+      verdictIcon.style.background = "transparent";
+      verdictIcon.style.color = "var(--ink)";
+      verdictIcon.innerHTML = '<span class="spinner"></span>';
+      verdictTitle.textContent = "Verifying…";
+      verdictTitle.style.color = "var(--ink)";
+      verdictSub.textContent = "Checking the AIoTIE register for ID " + id;
+      queriedIdEl.classList.add("hidden");
+      detailsCard.classList.add("hidden");
+      resultNote.classList.add("hidden");
+
+      var url = GAS_API_URL +
+                (GAS_API_URL.indexOf("?") === -1 ? "?" : "&") +
+                "id=" + encodeURIComponent(id);
+
+      fetch(url, {
+        method: "GET",
+        credentials: "omit",
+        // Some browsers add a Content-Type that triggers a CORS
+        // preflight; an explicit empty header set avoids that.
+        headers: {},
+        cache: "no-store"
+      })
+        .then(function (response) {
+          if (!response.ok) {
+            throw new Error("Server returned HTTP " + response.status);
+          }
+          return response.json();
+        })
+        .then(function (res) {
+          setBusy(false);
+          if (!res || res.ok === false) {
+            renderInvalid(id, (res && res.message) || "Lookup failed.");
+            return;
+          }
+          if (res.isGenuine) {
+            renderGenuine(res);
+          } else {
+            renderInvalid(res.queriedId || id, res.message || "Not a valid certificate.");
+          }
+        })
+        .catch(function (err) {
+          setBusy(false);
+          renderInvalid(id, (err && err.message) ? err.message : String(err));
+        });
+    }
+
+    // IDs of every row that can appear in the details card.
+    // renderGenuine_ hides all of these first, then the
+    // type-specific helper shows just the rows relevant to that
+    // artifact type. Keeps the dispatch logic to one place.
+    var ALL_DETAIL_ROW_IDS = [
+      "rowAiotieId", "rowProductTitle", "rowLeader", "rowMembers",
+      "rowAuthCode", "rowJurorName", "rowJurorAffiliation",
+      "rowJurorCountry", "rowAppointment",
+      "rowInstitution", "rowIssuedAt"
+    ];
+
+    function hideAllDetailRows_() {
+      for (var i = 0; i < ALL_DETAIL_ROW_IDS.length; i++) {
+        var el = document.getElementById(ALL_DETAIL_ROW_IDS[i]);
+        if (el) el.classList.add("hidden");
+      }
+    }
+
+    function showRow_(id, value) {
+      if (!value) return;
+      var row = document.getElementById(id);
+      if (row) row.classList.remove("hidden");
+    }
+
+    function renderGenuine(res) {
+      hideInputCards();
+      verdict.className = "verdict verdict--ok";
+      verdict.style.background = "";
+      verdict.style.border = "";
+      verdictIcon.textContent = "✓";
+      verdictIcon.style.background = "";
+      verdictIcon.style.color = "";
+      verdictTitle.style.color = "";
+
+      // Start every render from a clean slate so leftover rows
+      // from a previous scan don't bleed into this verdict card.
+      hideAllDetailRows_();
+
+      var type = String(res.type || "CERT").toUpperCase();
+      if (type === "JURY") {
+        renderGenuineJury_(res);
+      } else {
+        renderGenuineCert_(res);
+      }
+
+      detailsCard.classList.remove("hidden");
+      queriedIdEl.classList.add("hidden");
+
+      // Close the decoding modal, THEN scroll the verdict into
+      // view. Sequencing it that way lets the user see the modal
+      // close cleanly and the page glide down to the result.
+      hideDecodeModal(function () {
+        resultArea.scrollIntoView({ behavior: "smooth", block: "start" });
+      });
+    }
+
+    function renderGenuineCert_(res) {
+      verdictTitle.textContent = "Genuine Certificate";
+      verdictSub.textContent =
+        "This certificate is recorded in the official AIoTIE register. " +
+        "Compare the details below with the printed copy.";
+
+      $("dCardTitle").textContent = "Official Record";
+
+      $("dAiotieId").textContent     = res.aiotieId     || "—";
+      $("dProductTitle").textContent = res.productTitle || "—";
+      $("dLeader").textContent       = res.leaderName   || "—";
+
+      showRow_("rowAiotieId", true);
+      showRow_("rowProductTitle", true);
+      showRow_("rowLeader", true);
+
+      var ul = $("dMembers");
+      ul.innerHTML = "";
+      if (res.members && res.members.length) {
+        res.members.forEach(function (m) {
+          var li = document.createElement("li");
+          li.textContent = m;
+          ul.appendChild(li);
+        });
+        showRow_("rowMembers", true);
+      }
+
+      if (res.institution) {
+        $("dInstitution").textContent = res.institution;
+        showRow_("rowInstitution", true);
+      }
+      if (res.issuedAtStr) {
+        $("dIssuedAt").textContent = res.issuedAtStr;
+        showRow_("rowIssuedAt", true);
+      }
+
+      resultNote.classList.remove("hidden");
+      resultNote.innerHTML =
+        "<b>Don't see your name here, but the printed cert says you are a member?</b> " +
+        "Contact the AIoTIE Secretariat — the printed certificate may have been " +
+        "edited and is not authentic.";
+    }
+
+    function renderGenuineJury_(res) {
+      verdictTitle.textContent = "Genuine Jury Appointment";
+      verdictSub.textContent =
+        "This Jury Appointment Letter is recorded in the official AIoTIE register. " +
+        "Compare the juror's name below with the printed letter.";
+
+      $("dCardTitle").textContent = "Official Jury Record";
+
+      var year = String(res.eventYear || "").trim();
+      var appointmentLabel = year
+        ? ("Jury Member — AIoTIE " + year)
+        : "Jury Member — AIoTIE";
+
+      $("dAuthCode").textContent          = res.authCode    || "—";
+      $("dJurorName").textContent         = res.fullName    || "—";
+      $("dJurorAffiliation").textContent  = res.affiliation || "—";
+      $("dJurorCountry").textContent      = res.country     || "—";
+      $("dAppointment").textContent       = appointmentLabel;
+
+      showRow_("rowAuthCode", true);
+      showRow_("rowJurorName", true);
+      showRow_("rowJurorAffiliation", res.affiliation);
+      showRow_("rowJurorCountry", res.country);
+      showRow_("rowAppointment", true);
+
+      if (res.issuedAtStr) {
+        $("dIssuedAt").textContent = res.issuedAtStr;
+        showRow_("rowIssuedAt", true);
+      }
+
+      resultNote.classList.remove("hidden");
+      resultNote.innerHTML =
+        "<b>Name or affiliation different from the printed letter?</b> " +
+        "Contact the AIoTIE Secretariat — the printed letter may have " +
+        "been edited and is not authentic.";
+    }
+
+    function renderInvalid(queriedId, message) {
+      hideInputCards();
+      verdict.className = "verdict verdict--bad";
+      verdict.style.background = "";
+      verdict.style.border = "";
+      verdictIcon.textContent = "✕";
+      verdictIcon.style.background = "";
+      verdictIcon.style.color = "";
+      verdictTitle.textContent = "Not a Valid Certificate";
+      verdictTitle.style.color = "";
+      verdictSub.textContent = message || "Certificate not found.";
+
+      if (queriedId) {
+        queriedIdEl.classList.remove("hidden");
+        queriedIdEl.textContent = "Queried ID: " + queriedId;
+      } else {
+        queriedIdEl.classList.add("hidden");
+      }
+
+      detailsCard.classList.add("hidden");
+
+      resultNote.classList.remove("hidden");
+      resultNote.textContent =
+        "If you scanned this from a printed certificate, the certificate " +
+        "may be forged, expired, or not yet issued. Please report it to " +
+        "the AIoTIE Secretariat for verification.";
+
+      // Close the decoding modal first, then scroll the verdict
+      // into view — same sequencing as renderGenuine so the reveal
+      // feels consistent across genuine and invalid paths.
+      hideDecodeModal(function () {
+        resultArea.scrollIntoView({ behavior: "smooth", block: "start" });
+      });
+    }
+
+    btnStart.addEventListener("click", startScanner);
+    btnStop.addEventListener("click", teardownScanner);
+    btnAgain.addEventListener("click", function () {
+      hideResult();
+      showInputCards();
+      manualId.value = "";
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    });
+
+    manualForm.addEventListener("submit", function (ev) {
+      ev.preventDefault();
+      var raw = manualId.value || "";
+      var id = extractIdFromQrText(raw);
+      if (!id) {
+        manualId.focus();
+        return;
+      }
+      lookup(id);
+    });
+  </script>
+</body>
+</html>
